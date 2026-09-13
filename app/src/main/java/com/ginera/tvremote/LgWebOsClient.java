@@ -8,7 +8,13 @@ import androidx.annotation.NonNull;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
+import java.security.SecureRandom;
+import java.security.cert.X509Certificate;
 import java.util.concurrent.atomic.AtomicInteger;
+
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.X509TrustManager;
 
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
@@ -25,23 +31,33 @@ public class LgWebOsClient {
     private static final String PREFS = "lg_webos";
     private static final String CLIENT_KEY = "client_key";
 
-    private final OkHttpClient http = new OkHttpClient();
+    private final OkHttpClient standardHttp = new OkHttpClient();
+    private final OkHttpClient localTvSecureHttp;
     private final SharedPreferences prefs;
     private final AtomicInteger nextId = new AtomicInteger(1);
     private final Listener listener;
     private WebSocket commandSocket;
     private WebSocket pointerSocket;
+    private String currentIp;
 
     public LgWebOsClient(Context context, Listener listener) {
         this.listener = listener;
         this.prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+        this.localTvSecureHttp = createLocalTvSecureClient();
     }
 
     public void connect(String ipAddress) {
         close();
-        listener.onStatus("Connecting to LG TV…");
-        Request request = new Request.Builder().url("ws://" + ipAddress.trim() + ":3000").build();
-        commandSocket = http.newWebSocket(request, new WebSocketListener() {
+        currentIp = ipAddress.trim();
+        listener.onStatus("Connecting to LG TV on port 3000…");
+        connectEndpoint(false);
+    }
+
+    private void connectEndpoint(boolean secure) {
+        String url = (secure ? "wss://" : "ws://") + currentIp + (secure ? ":3001" : ":3000");
+        Request request = new Request.Builder().url(url).build();
+        OkHttpClient client = secure ? localTvSecureHttp : standardHttp;
+        commandSocket = client.newWebSocket(request, new WebSocketListener() {
             @Override public void onOpen(@NonNull WebSocket webSocket, @NonNull Response response) {
                 listener.onStatus("Approve the pairing request on the LG TV");
                 sendRegistration(webSocket);
@@ -52,13 +68,40 @@ public class LgWebOsClient {
             }
 
             @Override public void onFailure(@NonNull WebSocket webSocket, @NonNull Throwable t, Response response) {
-                listener.onStatus("Connection failed: " + t.getMessage());
+                if (!secure && commandSocket == webSocket) {
+                    listener.onStatus("Port 3000 unavailable; trying secure LG port 3001…");
+                    connectEndpoint(true);
+                } else if (secure && commandSocket == webSocket) {
+                    listener.onStatus("LG connection failed on ports 3000 and 3001: " + safeMessage(t));
+                }
             }
 
             @Override public void onClosed(@NonNull WebSocket webSocket, int code, @NonNull String reason) {
-                listener.onStatus("LG disconnected");
+                if (commandSocket == webSocket) listener.onStatus("LG disconnected");
             }
         });
+    }
+
+    private OkHttpClient createLocalTvSecureClient() {
+        try {
+            X509TrustManager localTrust = new X509TrustManager() {
+                @Override public void checkClientTrusted(X509Certificate[] chain, String authType) {}
+                @Override public void checkServerTrusted(X509Certificate[] chain, String authType) {}
+                @Override public X509Certificate[] getAcceptedIssuers() { return new X509Certificate[0]; }
+            };
+            SSLContext ssl = SSLContext.getInstance("TLS");
+            ssl.init(null, new TrustManager[]{localTrust}, new SecureRandom());
+            return new OkHttpClient.Builder()
+                    .sslSocketFactory(ssl.getSocketFactory(), localTrust)
+                    .hostnameVerifier((hostname, session) -> hostname.equals(currentIp))
+                    .build();
+        } catch (Exception e) {
+            return standardHttp;
+        }
+    }
+
+    private String safeMessage(Throwable t) {
+        return t.getMessage() == null ? t.getClass().getSimpleName() : t.getMessage();
     }
 
     private void sendRegistration(WebSocket socket) {
@@ -74,7 +117,8 @@ public class LgWebOsClient {
 
             JSONObject manifest = new JSONObject()
                     .put("manifestVersion", 1)
-                    .put("appVersion", "1.0.0")
+                    .put("appVersion", "1.0.1")
+                    .put("permissions", permissions)
                     .put("signed", new JSONObject()
                             .put("appId", "com.ginera.tvremote")
                             .put("vendorId", "com.ginera")
@@ -104,8 +148,8 @@ public class LgWebOsClient {
             JSONObject json = new JSONObject(message);
             String type = json.optString("type");
             if ("registered".equals(type)) {
-                String key = json.optJSONObject("payload") == null ? "" :
-                        json.optJSONObject("payload").optString("client-key");
+                JSONObject payload = json.optJSONObject("payload");
+                String key = payload == null ? "" : payload.optString("client-key");
                 if (!key.isEmpty()) prefs.edit().putString(CLIENT_KEY, key).apply();
                 listener.onStatus("LG connected");
                 listener.onPaired();
@@ -163,7 +207,8 @@ public class LgWebOsClient {
 
     private void connectPointer(String url) {
         if (url == null || url.isEmpty()) return;
-        pointerSocket = http.newWebSocket(new Request.Builder().url(url).build(), new WebSocketListener() {
+        OkHttpClient client = url.startsWith("wss://") ? localTvSecureHttp : standardHttp;
+        pointerSocket = client.newWebSocket(new Request.Builder().url(url).build(), new WebSocketListener() {
             @Override public void onOpen(@NonNull WebSocket webSocket, @NonNull Response response) {
                 listener.onStatus("LG connected • touchpad ready");
             }
@@ -190,9 +235,11 @@ public class LgWebOsClient {
     }
 
     public void close() {
-        if (pointerSocket != null) pointerSocket.close(1000, "Closing");
-        if (commandSocket != null) commandSocket.close(1000, "Closing");
+        WebSocket oldPointer = pointerSocket;
+        WebSocket oldCommand = commandSocket;
         pointerSocket = null;
         commandSocket = null;
+        if (oldPointer != null) oldPointer.close(1000, "Closing");
+        if (oldCommand != null) oldCommand.close(1000, "Closing");
     }
 }
