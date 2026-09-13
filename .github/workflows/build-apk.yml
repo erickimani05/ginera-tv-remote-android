@@ -11,13 +11,13 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Set up Java 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
@@ -25,15 +25,40 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
+      - name: Install Android SDK 35
+        run: |
+          yes | sdkmanager --licenses >/dev/null
+          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.10.2"
 
       - name: Build debug APK
-        run: gradle :app:assembleDebug --stacktrace
+        shell: bash
+        run: |
+          set +e
+          gradle :app:assembleDebug --stacktrace 2>&1 | tee build.log
+          result=${PIPESTATUS[0]}
+          if [ "$result" -ne 0 ]; then
+            echo "::group::Relevant build errors"
+            grep -E -A4 -B2 "FAILURE:|What went wrong|error:|Could not|Failed" build.log | tail -n 180 || tail -n 180 build.log
+            echo "::endgroup::"
+            echo "::error title=Android build failed::Open this step to see Relevant build errors."
+          fi
+          exit "$result"
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Ginera-build-log
+          path: build.log
+          if-no-files-found: ignore
 
       - name: Upload installable APK
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: Ginera-TV-Remote-debug
